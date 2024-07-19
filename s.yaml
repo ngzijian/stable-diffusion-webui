@@ -1,48 +1,231 @@
-edition: 1.0.0
-name: my-framework-app
-access: default
-services:
-  framework:
-    component: fc
+edition: 3.0.0 #  命令行YAML规范版本，遵循语义化版本（Semantic Versioning）规范
+name: fc-stable-diffusion2
+access: "{{ access }}"
+vars:
+  region: "{{ region }}"
+  prefix: "{{namespace}}"
+  functionName: "{{ functionName }}"
+  imageUrl: "registry.{{region}}.aliyuncs.com/aliyun-fc/fc-stable-diffusion:{{ if type === '动漫风格' }}anime-v16{{ else if type === '真人风格'}}realman-v16{{else if type === '轻量版'}}lite-v11{{else if type === 'TensorRT'}}tensorrt-v3{{else if type === '艺术字'}}character-v3{{ else }}sd1.5-v20{{/if}}"
+  filemgrToken: "{{ filemgrToken || '' }}"
+  enableCollect: "{{ enableCollect || '' }}"
+  filemgrFilename: "filemgr-1.3.0"
+  roleArn: "{{roleArn}}"
+  extraArgs: ""
+
+resources:
+  sd:
+    component: fc3
+    actions:
+      success-deploy:
+        - run: |
+            s cli fc3 concurrency put --reserved-concurrency 1 --region ${this.props.region} --function-name ${this.props.functionName} -a {{ access }}
+          path: ./
+        # - component: fc3 concurrency put --reserved-concurrency 1
     props:
-      region: cn-hangzhou
-      service:
-        name: serverless-devs-application
-      function:
-        name: stable-diffusion-webui-s6jj
-        description: Initialize
-        runtime: custom
-        environmentVariables:
-          PATH: >-
-            /opt/python3.10/bin:/usr/local/bin/apache-maven/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ruby/bin:/opt/bin:/code:/code/bin
-          PYTHONPATH: /opt/python:/code
-          LD_LIBRARY_PATH: >-
-            /code:/code/lib:/usr/local/lib:/opt/lib:/opt/php8.1/lib:/opt/php8.0/lib:/opt/php7.2/lib
-        layers:
-          - acs:fc:cn-hangzhou:official:layers/Python310/versions/2
-          - >-
-            acs:fc:cn-hangzhou:official:layers/Python310-Package-Collection/versions/2
-          - acs:fc:cn-hangzhou:official:layers/Python3-Flask2x/versions/2
-        memorySize: 32768
-        cpu: 8
-        timeout: 60
-        codeUri: ./
-        diskSize: 512
-        caPort: 9000
-        customRuntimeConfig:
-          command:
-            - python
-          args:
-            - app.py
+      region: "${vars.region}"
+      functionName: "${vars.prefix}__${vars.functionName}"
+      description: Stable Diffusion WebUI 函数
+      handler: index.handler
+      role: ${vars.roleArn}
+      timeout: 7200
+      diskSize: 512
+      gpuConfig:
+        gpuMemorySize: 16384
+        gpuType: fc.gpu.tesla.1
+      runtime: custom-container
+      cpu: 8
+      customContainerConfig:
+        accelerationType: Default
+        image: ${vars.imageUrl}
+        webServerMode: true
+        port: 7860
+      instanceConcurrency: 100
+      memorySize: 32768
+      environmentVariables:
+        EXTRA_ARGS: "${vars.extraArgs}"
+        ENABLE_COLLECT: "${vars.enableCollect}"
+
+  filemgr:
+    component: fc3
+    actions:
+      pre-deploy:
+        - run: |
+            mkdir -p code && \
+            cd code && \
+            curl http://serverless-tool-images.oss-cn-hangzhou.aliyuncs.com/aigc/filemgr/${vars.filemgrFilename}.zip -o filemgr.zip && \
+            unzip -o filemgr.zip && \
+            mv dist/ filemgr
+          path: ./
+    props:
+      region: ${vars.region}
+      functionName: "${vars.prefix}__admin"
+      description: "模型管理辅助工具"
+      code: "./code/filemgr"
+      runtime: custom
+      timeout: 7200
+      memorySize: 3072
+      cpu: 2.0
+      diskSize: 512
+      instanceConcurrency: 100
+      role: ${vars.roleArn}
+      customRuntimeConfig:
+        command:
+          - ./server
+        port: 9000
+      environmentVariables:
+        TOKEN: "${vars.filemgrToken}"
+        ENABLE_COLLECT: "${vars.enableCollect}"
+        # SD_VERSION: ""
+        # SD_FUNCTION_NAME: ${stable-diffusion.props.function.name}
+        # SD_DOMAIN: ${stable-diffusion.output.url.custom_domain[0].domain}
+      layers:
+        - "acs:fc:${vars.region}:official:layers/ServerlessDevs/versions/1"
+        - "acs:fc:${vars.region}:official:layers/Python310/versions/2"
       triggers:
-        - name: httpTrigger
-          type: http
-          config:
+        - triggerName: httpTrigger
+          triggerType: http
+          qualifier: LATEST
+          triggerConfig:
             authType: anonymous
+            disableURLInternet: false
             methods:
               - GET
               - POST
               - PUT
               - DELETE
-              - HEAD
-              - PATCH
+              - OPTIONS
+
+  control:
+    component: fc3
+    actions:
+      success-deploy:
+        - run: |
+            s cli fc3 concurrency put --reserved-concurrency 1 --region ${this.props.region} --function-name ${this.props.functionName} -a {{ access }}
+          path: ./
+        # - component: fc3 concurrency put --reserved-concurrency 1
+    props:
+      region: ${vars.region}
+      functionName: "${vars.prefix}__control"
+      description: "Serverless Stable Diffusion API 控制函数"
+      code: "./code/serverless-stable-diffusion-api"
+      runtime: custom
+      timeout: 7200
+      memorySize: 1024
+      cpu: 1.0
+      diskSize: 512
+      instanceConcurrency: 10
+      role: ${vars.roleArn}
+      customRuntimeConfig:
+        command:
+          - ./proxy
+        port: 7860
+      environmentVariables:
+        SERVER_NAME: "control"
+        OTS_ENDPOINT: ""
+        OTS_INSTANCE: ""
+        EXTRA_ARGS: "--nowebui --api"
+
+      triggers:
+        - triggerName: httpTrigger
+          triggerType: http
+          qualifier: LATEST
+          triggerConfig:
+            authType: anonymous
+            disableURLInternet: true
+            methods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+
+  proxy:
+    component: fc3
+    props:
+      region: ${vars.region}
+      functionName: "${vars.prefix}__proxy"
+      description: "Serverless Stable Diffusion API 网关函数"
+      code: "./code/serverless-stable-diffusion-api"
+      runtime: custom
+      timeout: 7200
+      memorySize: 1024
+      cpu: 1.0
+      diskSize: 512
+      instanceConcurrency: 100
+      role: ${vars.roleArn}
+      customRuntimeConfig:
+        command:
+          - ./proxy
+        port: 7860
+      environmentVariables:
+        SERVER_NAME: "proxy"
+        DOWNSTREAM: "${resources.control.output.url.system_intranet_url}"
+        OTS_ENDPOINT: ""
+        OTS_INSTANCE: ""
+
+      triggers:
+        - triggerName: httpTrigger
+          triggerType: http
+          qualifier: LATEST
+          triggerConfig:
+            authType: anonymous
+            disableURLInternet: false
+            methods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+
+  custom-domain-sd:
+    component: fc3-domain
+    props: #  组件的属性值
+      region: ${vars.region}
+      domainName: auto
+      protocol: HTTP
+      routeConfig:
+        routes:
+          - functionName: ${resources.sd.props.functionName}
+            methods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            path: /*
+            qualifier: LATEST
+
+  custom-domain-filemgr:
+    component: fc3-domain
+    props: #  组件的属性值
+      region: ${vars.region}
+      domainName: auto
+      protocol: HTTP
+      routeConfig:
+        routes:
+          - functionName: ${resources.filemgr.props.functionName}
+            methods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            path: /*
+            qualifier: LATEST
+
+  custom-domain-proxy:
+    component: fc3-domain
+    props: #  组件的属性值
+      region: ${vars.region}
+      domainName: auto
+      protocol: HTTP
+      routeConfig:
+        routes:
+          - functionName: ${resources.proxy.props.functionName}
+            methods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            path: /*
+            qualifier: LATEST
